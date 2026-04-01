@@ -1,32 +1,51 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
-import { Input } from '@/components/ui/input';
-import { Textarea } from '@/components/ui/textarea';
-import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import { Progress } from '@/components/ui/progress';
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
-import { 
-  Download, 
-  FileText, 
-  Music, 
-  Video, 
-  Trash2, 
-  History, 
+import React, { useEffect, useMemo, useState } from 'react';
+import {
   AlertCircle,
   CheckCircle2,
+  Download,
+  FileText,
+  Globe2,
+  History,
   Loader2,
+  Music,
   Package,
-  ExternalLink
+  Trash2,
+  Video,
 } from 'lucide-react';
-import { detectPlatform, validateURL } from '@/lib/utils/platform-detector';
-import { addToHistory, getHistory, removeFromHistory, clearHistory } from '@/lib/utils/storage';
+
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
+import { Progress } from '@/components/ui/progress';
+import { Textarea } from '@/components/ui/textarea';
+import { resolveBatchUrls, resolveUrl } from '@/lib/platforms/resolver';
+import {
+  buildSafeFilename,
+  downloadResolvedItem,
+  fetchRemoteItemBlob,
+  getDownloadFilename,
+} from '@/lib/utils/download';
 import { createZip } from '@/lib/utils/zip';
-import { parseZhihuArticle, htmlToMarkdown } from '@/lib/platforms/zhihu';
-import { parseXiaoyuzhouEpisode, parseXiaoyuzhouBatch } from '@/lib/platforms/xiaoyuzhou';
-import { parseBilibiliVideo, parseBilibiliBatch } from '@/lib/platforms/bilibili';
+import { clearHistory, getHistory, removeFromHistory, addToHistory } from '@/lib/utils/storage';
+import { detectPlatform, validateURL } from '@/lib/utils/platform-detector';
 import { DownloadItem, PlatformType } from '@/types';
+
+const SUPPORTED_PLATFORM_LABELS = [
+  '抖音',
+  '快手',
+  '视频号',
+  'TikTok',
+  '小红书',
+  '公众号',
+  'X',
+  'Bilibili',
+  'YouTube',
+  '知乎',
+  '小宇宙',
+];
 
 export default function Home() {
   const [url, setUrl] = useState('');
@@ -38,265 +57,204 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [history, setHistory] = useState<DownloadItem[]>([]);
   const [detectedPlatform, setDetectedPlatform] = useState<PlatformType>('unknown');
+  const [activeDownloadId, setActiveDownloadId] = useState<string | null>(null);
+  const [exportingZip, setExportingZip] = useState(false);
 
-  // 加载历史记录
   useEffect(() => {
     setHistory(getHistory());
   }, []);
 
-  // 检测平台
   useEffect(() => {
-    if (url) {
-      setDetectedPlatform(detectPlatform(url));
-    }
+    setDetectedPlatform(url.trim() ? detectPlatform(url.trim()) : 'unknown');
   }, [url]);
 
-  // 单个下载
-  const handleDownload = async () => {
-    if (!url || !validateURL(url)) {
-      setError('请输入有效的URL');
-      return;
-    }
+  const successCount = useMemo(
+    () => results.filter((item) => item.status === 'success').length,
+    [results]
+  );
 
-    const platform = detectPlatform(url);
-    if (platform === 'unknown') {
-      setError('暂不支持该平台，目前支持知乎、小宇宙、B站');
-      return;
-    }
-
+  const runWithProgress = async <T,>(work: () => Promise<T>) => {
     setLoading(true);
     setError(null);
     setProgress(0);
 
+    const progressInterval = window.setInterval(() => {
+      setProgress((current) => (current >= 90 ? current : current + 10));
+    }, 250);
+
     try {
-      // 模拟进度
-      const progressInterval = setInterval(() => {
-        setProgress(p => (p >= 90 ? 90 : p + 10));
-      }, 300);
-
-      let result: DownloadItem;
-
-      switch (platform) {
-        case 'zhihu':
-          const zhihuData = await parseZhihuArticle(url);
-          const markdown = htmlToMarkdown(zhihuData.content);
-          result = {
-            id: Date.now().toString(),
-            platform,
-            url,
-            title: zhihuData.title,
-            author: zhihuData.author,
-            content: markdown,
-            fileType: 'markdown',
-            status: 'success',
-            createdAt: Date.now(),
-          };
-          break;
-
-        case 'xiaoyuzhou':
-          const xyzData = await parseXiaoyuzhouEpisode(url);
-          result = {
-            id: Date.now().toString(),
-            platform,
-            url,
-            title: xyzData.title,
-            thumbnail: xyzData.cover,
-            downloadUrl: xyzData.audioUrl,
-            duration: xyzData.duration,
-            fileType: 'audio',
-            status: 'success',
-            createdAt: Date.now(),
-          };
-          break;
-
-        case 'bilibili':
-          const biliData = await parseBilibiliVideo(url);
-          result = {
-            id: Date.now().toString(),
-            platform,
-            url,
-            title: biliData.title,
-            author: biliData.author,
-            thumbnail: biliData.cover,
-            downloadUrl: biliData.videoUrl,
-            duration: biliData.duration,
-            fileType: 'video',
-            status: 'success',
-            createdAt: Date.now(),
-          };
-          break;
-
-        default:
-          throw new Error('不支持的平台');
-      }
-
-      clearInterval(progressInterval);
+      const value = await work();
       setProgress(100);
-      setResults([result]);
-      addToHistory(result);
+      return value;
+    } finally {
+      window.clearInterval(progressInterval);
+      setLoading(false);
+    }
+  };
+
+  const handleDownload = async () => {
+    const nextUrl = url.trim();
+
+    if (!nextUrl || !validateURL(nextUrl)) {
+      setError('请输入有效的 URL');
+      return;
+    }
+
+    try {
+      const item = await runWithProgress(() => resolveUrl(nextUrl));
+      setResults([item]);
+
+      if (item.status === 'success') {
+        addToHistory(item);
+        setHistory(getHistory());
+      }
+    } catch (err) {
+      setResults([]);
+      setError(err instanceof Error ? err.message : '解析失败');
+    }
+  };
+
+  const handleBatchDownload = async () => {
+    const urls = batchUrls
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+
+    if (urls.length === 0) {
+      setError('请输入至少一个链接');
+      return;
+    }
+
+    if (urls.length > 20) {
+      setError('批量解析最多支持 20 个链接');
+      return;
+    }
+
+    const invalid = urls.find((item) => !validateURL(item));
+    if (invalid) {
+      setError(`存在无效链接: ${invalid}`);
+      return;
+    }
+
+    try {
+      const items = await runWithProgress(() => resolveBatchUrls(urls));
+      setResults(items);
+
+      items
+        .filter((item) => item.status === 'success')
+        .forEach((item) => addToHistory(item));
+
       setHistory(getHistory());
+    } catch (err) {
+      setResults([]);
+      setError(err instanceof Error ? err.message : '批量解析失败');
+    }
+  };
+
+  const downloadSingle = async (item: DownloadItem) => {
+    try {
+      setActiveDownloadId(item.id);
+      await downloadResolvedItem(item);
     } catch (err) {
       setError(err instanceof Error ? err.message : '下载失败');
     } finally {
-      setLoading(false);
+      setActiveDownloadId(null);
     }
   };
 
-  // 批量下载
-  const handleBatchDownload = async () => {
-    const urls = batchUrls.split('\n').filter(u => u.trim());
-    
-    if (urls.length === 0) {
-      setError('请输入至少一个URL');
+  const downloadBatch = async () => {
+    if (results.length === 0) {
       return;
     }
-
-    if (urls.length > 10) {
-      setError('批量下载最多支持10个链接');
-      return;
-    }
-
-    // 检测所有链接的平台
-    const platforms = urls.map(detectPlatform);
-    const uniquePlatforms = Array.from(new Set(platforms));
-    
-    if (uniquePlatforms.length !== 1 || uniquePlatforms[0] === 'unknown') {
-      setError('批量下载要求所有链接来自同一平台（知乎/小宇宙/B站）');
-      return;
-    }
-
-    const platform = uniquePlatforms[0];
-
-    setLoading(true);
-    setError(null);
-    setProgress(0);
-    setResults([]);
 
     try {
-      let batchResults: DownloadItem[] = [];
+      setExportingZip(true);
 
-      switch (platform) {
-        case 'xiaoyuzhou':
-          const xyzBatchData = await parseXiaoyuzhouBatch(urls);
-          batchResults = xyzBatchData.map((data, index) => ({
-            id: `${Date.now()}_${index}`,
-            platform,
-            url: urls[index],
-            title: data.title,
-            thumbnail: data.cover,
-            downloadUrl: data.audioUrl,
-            duration: data.duration,
-            fileType: 'audio',
-            status: 'success',
-            createdAt: Date.now(),
-          }));
-          break;
+      const files = [];
 
-        case 'bilibili':
-          const biliBatchData = await parseBilibiliBatch(urls);
-          batchResults = biliBatchData.map((data, index) => ({
-            id: `${Date.now()}_${index}`,
-            platform,
-            url: urls[index],
-            title: data.title,
-            author: data.author,
-            thumbnail: data.cover,
-            downloadUrl: data.videoUrl,
-            duration: data.duration,
-            fileType: 'video',
-            status: 'success',
-            createdAt: Date.now(),
-          }));
-          break;
+      for (const item of results) {
+        if (item.content) {
+          files.push({
+            name: getDownloadFilename(item),
+            content: item.content,
+          });
+          continue;
+        }
 
-        default:
-          throw new Error('该平台暂不支持批量下载');
+        if (item.downloadUrl && item.status === 'success') {
+          try {
+            const { blob, filename } = await fetchRemoteItemBlob(item);
+            files.push({
+              name: filename,
+              content: blob,
+            });
+            continue;
+          } catch (err) {
+            files.push({
+              name: buildSafeFilename(`${item.title || 'download'}_下载失败`, 'txt'),
+              content: err instanceof Error ? err.message : '下载失败',
+            });
+            continue;
+          }
+        }
+
+        const body = [
+          `标题：${item.title}`,
+          `平台：${getPlatformName(item.platform)}`,
+          `原链接：${item.url}`,
+          item.downloadUrl ? `解析到的下载链接：${item.downloadUrl}` : '',
+          item.summary ? `摘要：${item.summary}` : '',
+          item.error ? `错误：${item.error}` : '',
+        ]
+          .filter(Boolean)
+          .join('\n');
+
+        files.push({
+          name: buildSafeFilename(item.title || 'result', 'txt'),
+          content: body,
+        });
       }
 
-      // 模拟进度
-      for (let i = 0; i <= 100; i += 10) {
-        setProgress(i);
-        await new Promise(resolve => setTimeout(resolve, 200));
-      }
-
-      setResults(batchResults);
-      batchResults.forEach(item => addToHistory(item));
-      setHistory(getHistory());
+      await createZip(files);
     } catch (err) {
-      setError(err instanceof Error ? err.message : '批量下载失败');
+      setError(err instanceof Error ? err.message : '打包导出失败');
     } finally {
-      setLoading(false);
+      setExportingZip(false);
     }
   };
 
-  // 下载单个文件
-  const downloadSingle = (item: DownloadItem) => {
-    if (item.content) {
-      // Markdown文件
-      const blob = new Blob([item.content], { type: 'text/markdown' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `${item.title}.md`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-    } else if (item.downloadUrl) {
-      // 音频/视频链接
-      window.open(item.downloadUrl, '_blank');
-    }
-  };
-
-  // 批量打包下载
-  const downloadBatch = async () => {
-    if (results.length === 0) return;
-
-    const files = results.map(item => {
-      if (item.content) {
-        return {
-          name: `${item.title}.md`,
-          content: item.content,
-        };
-      } else {
-        // 对于音频/视频，创建一个包含链接的文本文件
-        return {
-          name: `${item.title}_链接.txt`,
-          content: item.downloadUrl || '',
-        };
-      }
-    });
-
-    await createZip(files);
-  };
-
-  // 删除历史记录
   const handleDeleteHistory = (id: string) => {
     removeFromHistory(id);
     setHistory(getHistory());
   };
 
-  // 清空历史
   const handleClearHistory = () => {
     clearHistory();
     setHistory([]);
   };
 
-  // 获取平台图标
   const getPlatformIcon = (platform: PlatformType) => {
     switch (platform) {
       case 'zhihu':
+      case 'wechat':
         return <FileText className="h-4 w-4" />;
       case 'xiaoyuzhou':
         return <Music className="h-4 w-4" />;
       case 'bilibili':
+      case 'douyin':
+      case 'kuaishou':
+      case 'videohao':
+      case 'tiktok':
+      case 'x':
+      case 'youtube':
         return <Video className="h-4 w-4" />;
+      case 'xiaohongshu':
+        return <Globe2 className="h-4 w-4" />;
       default:
-        return null;
+        return <Globe2 className="h-4 w-4" />;
     }
   };
 
-  // 获取平台名称
   const getPlatformName = (platform: PlatformType) => {
     switch (platform) {
       case 'zhihu':
@@ -304,7 +262,23 @@ export default function Home() {
       case 'xiaoyuzhou':
         return '小宇宙';
       case 'bilibili':
-        return 'B站';
+        return 'Bilibili';
+      case 'douyin':
+        return '抖音';
+      case 'kuaishou':
+        return '快手';
+      case 'videohao':
+        return '视频号';
+      case 'tiktok':
+        return 'TikTok';
+      case 'xiaohongshu':
+        return '小红书';
+      case 'wechat':
+        return '公众号';
+      case 'x':
+        return 'X';
+      case 'youtube':
+        return 'YouTube';
       default:
         return '未知';
     }
@@ -312,43 +286,43 @@ export default function Home() {
 
   return (
     <main className="min-h-screen bg-gradient-to-b from-gray-50 to-gray-100 py-12 px-4 sm:px-6 lg:px-8">
-      <div className="max-w-4xl mx-auto">
-        {/* Header */}
-        <div className="text-center mb-12">
-          <h1 className="text-4xl font-bold text-gray-900 mb-4">
-            Content Downloader
-          </h1>
-          <p className="text-lg text-gray-600">
-            免费下载知乎文章、小宇宙播客、B站视频
+      <div className="mx-auto max-w-5xl">
+        <div className="mb-12 text-center">
+          <h1 className="mb-4 text-4xl font-bold text-gray-900">Content Downloader</h1>
+          <p className="mx-auto max-w-3xl text-lg text-gray-600">
+            统一解析抖音、快手、视频号、TikTok、小红书、公众号、X、Bilibili、YouTube、知乎、小宇宙链接
+          </p>
+          <p className="mt-3 text-sm text-gray-500">
+            支持单条解析和批量解析，批量模式允许混合平台，单次最多 20 条。
           </p>
         </div>
 
-        {/* Main Card */}
         <Card className="mb-8">
           <CardHeader>
             <CardTitle>输入链接</CardTitle>
             <CardDescription>
-              {isBatchMode 
-                ? '每行输入一个链接，最多10个' 
-                : '粘贴知乎/小宇宙/B站链接'}
+              {isBatchMode ? '每行一个链接，可混合平台，最多 20 个。' : '粘贴任一受支持平台的链接。'}
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            {/* Input Area */}
             {isBatchMode ? (
               <Textarea
-                placeholder="https://xiaoyuzhoufm.com/episode/xxx&#10;https://xiaoyuzhoufm.com/episode/yyy"
+                placeholder={[
+                  'https://www.douyin.com/video/...',
+                  'https://www.youtube.com/watch?v=...',
+                  'https://mp.weixin.qq.com/s?...',
+                ].join('\n')}
                 value={batchUrls}
-                onChange={(e) => setBatchUrls(e.target.value)}
-                className="min-h-[120px]"
+                onChange={(event) => setBatchUrls(event.target.value)}
+                className="min-h-[140px]"
                 disabled={loading}
               />
             ) : (
               <div className="space-y-2">
                 <Input
-                  placeholder="https://zhihu.com/... 或 https://xiaoyuzhoufm.com/... 或 https://bilibili.com/..."
+                  placeholder="粘贴抖音 / 快手 / 视频号 / TikTok / 小红书 / 公众号 / X / Bilibili / YouTube / 知乎 / 小宇宙链接"
                   value={url}
-                  onChange={(e) => setUrl(e.target.value)}
+                  onChange={(event) => setUrl(event.target.value)}
                   disabled={loading}
                 />
                 {detectedPlatform !== 'unknown' && (
@@ -360,23 +334,24 @@ export default function Home() {
               </div>
             )}
 
-            {/* Mode Toggle */}
-            <div className="flex items-center gap-4">
+            <div className="flex flex-wrap items-center gap-3">
               <Button
                 variant="outline"
                 size="sm"
                 onClick={() => {
-                  setIsBatchMode(!isBatchMode);
+                  setIsBatchMode((current) => !current);
                   setError(null);
                   setResults([]);
                 }}
                 disabled={loading}
               >
-                {isBatchMode ? '切换到单条下载' : '切换到批量下载'}
+                {isBatchMode ? '切换到单条解析' : '切换到批量解析'}
               </Button>
+              <span className="text-xs text-muted-foreground">
+                已支持：{SUPPORTED_PLATFORM_LABELS.join(' / ')}
+              </span>
             </div>
 
-            {/* Progress */}
             {loading && (
               <div className="space-y-2">
                 <div className="flex justify-between text-sm">
@@ -387,7 +362,6 @@ export default function Home() {
               </div>
             )}
 
-            {/* Error */}
             {error && (
               <Alert variant="destructive">
                 <AlertCircle className="h-4 w-4" />
@@ -396,7 +370,6 @@ export default function Home() {
               </Alert>
             )}
 
-            {/* Action Button */}
             <Button
               className="w-full"
               size="lg"
@@ -411,23 +384,31 @@ export default function Home() {
               ) : (
                 <>
                   <Download className="mr-2 h-4 w-4" />
-                  {isBatchMode ? '批量解析' : '开始下载'}
+                  {isBatchMode ? '批量解析' : '开始解析'}
                 </>
               )}
             </Button>
           </CardContent>
         </Card>
 
-        {/* Results */}
         {results.length > 0 && (
           <Card className="mb-8">
             <CardHeader>
-              <div className="flex items-center justify-between">
-                <CardTitle>下载结果</CardTitle>
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <CardTitle>解析结果</CardTitle>
+                  <CardDescription>
+                    共 {results.length} 条，成功 {successCount} 条，失败 {results.length - successCount} 条
+                  </CardDescription>
+                </div>
                 {results.length > 1 && (
-                  <Button variant="outline" size="sm" onClick={downloadBatch}>
-                    <Package className="mr-2 h-4 w-4" />
-                    打包下载
+                  <Button variant="outline" size="sm" onClick={downloadBatch} disabled={exportingZip}>
+                    {exportingZip ? (
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    ) : (
+                      <Package className="mr-2 h-4 w-4" />
+                    )}
+                    {exportingZip ? '打包中...' : '打包导出'}
                   </Button>
                 )}
               </div>
@@ -436,52 +417,70 @@ export default function Home() {
               {results.map((item) => (
                 <div
                   key={item.id}
-                  className="flex items-start gap-4 p-4 rounded-lg border bg-card"
+                  className={`rounded-lg border p-4 ${item.status === 'failed' ? 'border-red-200 bg-red-50' : 'bg-card'}`}
                 >
-                  {item.thumbnail && (
-                    <img
-                      src={item.thumbnail}
-                      alt={item.title}
-                      className="w-24 h-16 object-cover rounded-md"
-                    />
-                  )}
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 mb-1">
-                      {getPlatformIcon(item.platform)}
-                      <span className="text-sm text-muted-foreground">
-                        {getPlatformName(item.platform)}
-                      </span>
+                  <div className="flex items-start gap-4">
+                    {item.thumbnail && (
+                      <img
+                        src={item.thumbnail}
+                        alt={item.title}
+                        className="h-16 w-24 rounded-md object-cover"
+                      />
+                    )}
+                    <div className="min-w-0 flex-1">
+                      <div className="mb-1 flex items-center gap-2 text-sm text-muted-foreground">
+                        {getPlatformIcon(item.platform)}
+                        <span>{getPlatformName(item.platform)}</span>
+                        <span>·</span>
+                        <span>{item.source || '解析'}</span>
+                        <span>·</span>
+                        <span className={item.status === 'failed' ? 'text-red-600' : 'text-emerald-600'}>
+                          {item.status === 'failed' ? '失败' : '成功'}
+                        </span>
+                      </div>
+                      <h4 className="truncate font-medium">{item.title}</h4>
+                      {item.author && (
+                        <p className="text-sm text-muted-foreground">作者：{item.author}</p>
+                      )}
+                      {item.duration && (
+                        <p className="text-sm text-muted-foreground">时长：{item.duration}</p>
+                      )}
+                      {item.summary && (
+                        <p className="mt-1 line-clamp-2 text-sm text-muted-foreground">{item.summary}</p>
+                      )}
+                      {item.error && (
+                        <p className="mt-2 text-sm text-red-600">{item.error}</p>
+                      )}
                     </div>
-                    <h4 className="font-medium truncate">{item.title}</h4>
-                    {item.author && (
-                      <p className="text-sm text-muted-foreground">
-                        作者：{item.author}
-                      </p>
-                    )}
-                    {item.duration && (
-                      <p className="text-sm text-muted-foreground">
-                        时长：{item.duration}
-                      </p>
-                    )}
+                    <div className="flex items-center gap-2">
+                      <Button
+                        size="sm"
+                        variant={item.status === 'failed' ? 'outline' : 'default'}
+                        onClick={() => {
+                          void downloadSingle(item);
+                        }}
+                        disabled={activeDownloadId === item.id}
+                      >
+                        {activeDownloadId === item.id ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : item.status === 'failed' ? (
+                          <AlertCircle className="h-4 w-4" />
+                        ) : (
+                          <Download className="h-4 w-4" />
+                        )}
+                      </Button>
+                    </div>
                   </div>
-                  <Button
-                    size="sm"
-                    onClick={() => downloadSingle(item)}
-                    disabled={!item.content && !item.downloadUrl}
-                  >
-                    <Download className="h-4 w-4" />
-                  </Button>
                 </div>
               ))}
             </CardContent>
           </Card>
         )}
 
-        {/* History */}
         {history.length > 0 && (
           <Card>
             <CardHeader>
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-4">
                 <div className="flex items-center gap-2">
                   <History className="h-5 w-5" />
                   <CardTitle>历史记录</CardTitle>
@@ -499,19 +498,22 @@ export default function Home() {
             </CardHeader>
             <CardContent>
               <div className="space-y-2">
-                {history.slice(0, 5).map((item) => (
+                {history.slice(0, 8).map((item) => (
                   <div
                     key={item.id}
-                    className="flex items-center justify-between p-3 rounded-lg border"
+                    className="flex items-center justify-between rounded-lg border p-3"
                   >
-                    <div className="flex items-center gap-3 min-w-0">
-                      {getPlatformIcon(item.platform)}
-                      <span className="truncate">{item.title}</span>
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                        {getPlatformIcon(item.platform)}
+                        <span>{getPlatformName(item.platform)}</span>
+                        <span>·</span>
+                        <span>{new Date(item.createdAt).toLocaleString()}</span>
+                      </div>
+                      <div className="truncate">{item.title}</div>
                     </div>
                     <div className="flex items-center gap-2">
-                      <span className="text-sm text-muted-foreground">
-                        {new Date(item.createdAt).toLocaleDateString()}
-                      </span>
+                      <CheckCircle2 className="h-4 w-4 text-emerald-600" />
                       <Button
                         variant="ghost"
                         size="sm"
@@ -527,10 +529,11 @@ export default function Home() {
           </Card>
         )}
 
-        {/* Footer */}
         <footer className="mt-12 text-center text-sm text-muted-foreground">
-          <p className="mb-2">支持平台：知乎 | 小宇宙 | B站</p>
-          <p>仅供学习研究使用，请遵守各平台服务条款</p>
+          <p className="mb-2">
+            支持平台：{SUPPORTED_PLATFORM_LABELS.join(' / ')}
+          </p>
+          <p>仅供学习研究使用，请遵守各平台服务条款与相关法律法规。</p>
         </footer>
       </div>
     </main>
