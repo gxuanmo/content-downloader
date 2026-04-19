@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Content Downloader - 免费下载知乎/小宇宙/B站内容",
-  description: "免费下载知乎文章、小宇宙播客、B站视频，支持批量下载",
+  title: "Content Downloader - 多平台内容解析下载工具",
+  description: "统一解析抖音、快手、视频号、TikTok、小红书、公众号、X、Bilibili、YouTube、知乎、小宇宙链接，支持单条和批量解析",
 };
 
 export default function RootLayout({

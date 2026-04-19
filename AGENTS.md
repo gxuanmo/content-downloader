@@ -26,10 +26,13 @@ npx tsc --noEmit     # 类型检查不输出
 
 ```
 app/
-  api/               # API 路由（Serverless Functions）
-    bilibili/        # B站解析 API
-    xiaoyuzhou/      # 小宇宙解析 API
-    zhihu/           # 知乎解析 API
+  api/
+    resolve/         # 统一解析 API
+      route.ts       # POST /api/resolve - 单条解析
+      batch/
+        route.ts     # POST /api/resolve/batch - 批量解析
+    download/
+      route.ts       # POST /api/download - 媒体下载代理
   page.tsx           # 主页面
   layout.tsx         # 根布局
   globals.css        # 全局样式
@@ -37,14 +40,18 @@ app/
 components/ui/       # shadcn/ui 组件
 
 lib/
-  platforms/         # 平台解析逻辑
-    bilibili.ts
-    xiaoyuzhou.ts
-    zhihu.ts
-  utils/             # 工具函数
-    platform-detector.ts
+  platforms/
+    resolver.ts      # 客户端解析请求封装
+  server/
+    resolver.ts      # 服务端统一解析逻辑（所有平台）
+    yt-dlp.ts        # yt-dlp 调用封装
+    remote-url.ts    # SSRF 防护：远程 URL 校验
+    curl-download.ts # curl 下载回退
+  utils/
+    platform-detector.ts  # 平台检测
+    download.ts      # 客户端下载辅助
     storage.ts       # LocalStorage
-    zip.ts           # ZIP打包
+    zip.ts           # ZIP 打包
 
 types/               # TypeScript 类型定义
 ```
