@@ -16,6 +16,8 @@ import {
 } from './yt-dlp';
 
 const MAX_HTML_REDIRECTS = 5;
+const MAX_HTML_BYTES = 8 * 1024 * 1024;
+const MAX_JSON_BYTES = 2 * 1024 * 1024;
 
 const fetchDispatcher = new Agent({
   connect: {
@@ -166,7 +168,52 @@ function isAllowedUrl(url: string, platform: PlatformType): boolean {
   return PLATFORM_HOST_ALLOWLIST[platform].some((allowedHost) => host === allowedHost || host.endsWith(`.${allowedHost}`));
 }
 
-async function fetchHtml(url: string) {
+async function discardResponseBody(response: Response) {
+  try {
+    await response.body?.cancel();
+  } catch {}
+}
+
+async function readBodyWithLimit(response: Response, limit: number): Promise<string> {
+  const declared = Number(response.headers.get('content-length') || '0');
+  if (declared > limit) {
+    await discardResponseBody(response);
+    throw new Error(`上游响应体积超过限制 (${limit} 字节)`);
+  }
+
+  if (!response.body) {
+    return '';
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder('utf-8', { fatal: false });
+  let received = 0;
+  let result = '';
+
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) {
+        result += decoder.decode();
+        return result;
+      }
+      received += value.byteLength;
+      if (received > limit) {
+        try {
+          await reader.cancel();
+        } catch {}
+        throw new Error(`上游响应体积超过限制 (${limit} 字节)`);
+      }
+      result += decoder.decode(value, { stream: true });
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {}
+  }
+}
+
+async function fetchHtml(url: string, platform?: Exclude<PlatformType, 'unknown'>) {
   let currentUrl = await assertSafeRemoteUrl(url);
 
   for (let hop = 0; hop <= MAX_HTML_REDIRECTS; hop += 1) {
@@ -181,21 +228,33 @@ async function fetchHtml(url: string) {
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get('location');
       if (!location) {
+        await discardResponseBody(response);
         throw new Error(`页面请求失败 (${response.status})`);
       }
-      currentUrl = await assertSafeRemoteUrl(new URL(location, currentUrl).toString());
+      let nextUrl: URL;
       try {
-        await response.body?.cancel();
-      } catch {}
+        nextUrl = await assertSafeRemoteUrl(new URL(location, currentUrl).toString());
+      } catch (error) {
+        await discardResponseBody(response);
+        throw error;
+      }
+      if (platform && !isAllowedUrl(nextUrl.toString(), platform)) {
+        await discardResponseBody(response);
+        throw new Error('重定向目标不在该平台允许的域名列表内');
+      }
+      currentUrl = nextUrl;
+      await discardResponseBody(response);
       continue;
     }
 
     if (!response.ok) {
+      await discardResponseBody(response);
       throw new Error(`页面请求失败 (${response.status})`);
     }
 
+    const html = await readBodyWithLimit(response, MAX_HTML_BYTES);
     return {
-      html: await response.text(),
+      html,
       finalUrl: currentUrl.toString(),
     };
   }
@@ -292,20 +351,31 @@ async function resolveZhihu(url: string): Promise<DownloadItem> {
     throw new Error('暂不支持该知乎链接格式');
   }
 
-  const response = await fetch(apiUrl, {
+  const safeApiUrl = await assertSafeRemoteUrl(apiUrl);
+  const response = await fetch(safeApiUrl, {
     headers: {
       ...DEFAULT_HEADERS,
       Accept: 'application/json',
       Referer: 'https://www.zhihu.com/',
     },
     cache: 'no-store',
+    redirect: 'manual',
+    // @ts-expect-error undici dispatcher
+    dispatcher: fetchDispatcher,
   });
 
+  if (response.status >= 300 && response.status < 400) {
+    await discardResponseBody(response);
+    throw new Error(`知乎内容请求被重定向 (${response.status})`);
+  }
+
   if (!response.ok) {
+    await discardResponseBody(response);
     throw new Error(`知乎内容请求失败 (${response.status})`);
   }
 
-  const data = (await response.json()) as ZhihuApiResponse;
+  const rawJson = await readBodyWithLimit(response, MAX_JSON_BYTES);
+  const data = JSON.parse(rawJson) as ZhihuApiResponse;
   const payload: ZhihuPayload = Array.isArray(data.data) ? data.data[0] ?? {} : data;
   const title = payload.title || payload.question?.title || '知乎内容';
   const author = payload.author?.name || '匿名用户';
@@ -326,7 +396,7 @@ async function resolveZhihu(url: string): Promise<DownloadItem> {
 }
 
 async function resolveXiaoyuzhou(url: string): Promise<DownloadItem> {
-  const { html, finalUrl } = await fetchHtml(url);
+  const { html, finalUrl } = await fetchHtml(url, 'xiaoyuzhou');
   const $ = load(html);
 
   const audioMatch = html.match(/"audio"\s*:\s*{[^}]*"sourceUrl"\s*:\s*"([^"]+)"/);
@@ -376,7 +446,7 @@ async function resolveXiaoyuzhou(url: string): Promise<DownloadItem> {
 }
 
 async function resolveWechatArticle(url: string): Promise<DownloadItem> {
-  const { html, finalUrl } = await fetchHtml(url);
+  const { html, finalUrl } = await fetchHtml(url, 'wechat');
   const $ = load(html);
 
   const contentRoot = $('#js_content').length ? $('#js_content') : $('.rich_media_content').first();
@@ -415,7 +485,10 @@ async function resolveWechatArticle(url: string): Promise<DownloadItem> {
 }
 
 async function resolvePageFallback(url: string, platform: PlatformType): Promise<DownloadItem> {
-  const { html, finalUrl } = await fetchHtml(url);
+  const { html, finalUrl } = await fetchHtml(
+    url,
+    platform === 'unknown' ? undefined : platform
+  );
   const $ = load(html);
 
   const title =

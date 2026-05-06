@@ -3,7 +3,7 @@ import sanitizeFilename from 'sanitize-filename';
 import { Agent } from 'undici';
 
 import { downloadWithCurl } from '@/lib/server/curl-download';
-import { assertSafeRemoteUrl, createSafeLookup } from '@/lib/server/remote-url';
+import { RemoteUrlError, assertSafeRemoteUrl, createSafeLookup } from '@/lib/server/remote-url';
 import { PlatformType } from '@/types';
 
 export const runtime = 'nodejs';
@@ -99,6 +99,12 @@ function limitedStream(source: ReadableStream<Uint8Array>, limit: number): Reada
   });
 }
 
+async function discardBody(response: Response) {
+  try {
+    await response.body?.cancel();
+  } catch {}
+}
+
 async function fetchFollowingRedirects(initialUrl: URL, platform: PlatformType) {
   let currentUrl = initialUrl;
 
@@ -120,18 +126,23 @@ async function fetchFollowingRedirects(initialUrl: URL, platform: PlatformType) 
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get('location');
       if (!location) {
+        await discardBody(response);
         throw new Error(`上游返回 ${response.status} 但缺少 Location 头`);
       }
 
       const nextUrl = new URL(location, currentUrl);
-      currentUrl = await assertSafeRemoteUrl(nextUrl.toString());
       try {
-        await response.body?.cancel();
-      } catch {}
+        currentUrl = await assertSafeRemoteUrl(nextUrl.toString());
+      } catch (error) {
+        await discardBody(response);
+        throw error;
+      }
+      await discardBody(response);
       continue;
     }
 
     if (!response.ok || !response.body) {
+      await discardBody(response);
       throw new Error(`下载失败 (${response.status})`);
     }
 
@@ -147,11 +158,13 @@ async function fetchWithFallback(url: URL, platform: PlatformType, contentTypeHi
 
     const contentType = response.headers.get('content-type') || contentTypeHint;
     if (contentType.toLowerCase().includes('text/html')) {
+      await discardBody(response);
       throw new HtmlResponseError();
     }
 
     const contentLength = Number(response.headers.get('content-length') || '0');
     if (contentLength > MAX_DOWNLOAD_BYTES) {
+      await discardBody(response);
       throw new Error(`下载体积超过限制 (${MAX_DOWNLOAD_BYTES} 字节)`);
     }
 
@@ -211,6 +224,13 @@ export async function POST(request: NextRequest) {
       },
     });
   } catch (error) {
+    if (error instanceof RemoteUrlError || error instanceof TypeError) {
+      const message = error instanceof Error ? error.message : '请求参数无效';
+      return NextResponse.json(
+        { success: false, error: message },
+        { status: 400 }
+      );
+    }
     const message =
       error instanceof Error
         ? [error.message, error.cause instanceof Error ? error.cause.message : '']
