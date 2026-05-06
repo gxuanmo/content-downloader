@@ -1,6 +1,7 @@
 import 'server-only';
 
 import { lookup } from 'dns/promises';
+import { lookup as dnsLookup, type LookupAddress } from 'dns';
 import { isIP } from 'net';
 
 const BLOCKED_HOSTNAMES = new Set([
@@ -42,7 +43,7 @@ function isPrivateIpv6(address: string) {
   );
 }
 
-function isPrivateAddress(address: string) {
+export function isPrivateAddress(address: string) {
   const family = isIP(address);
 
   if (family === 4) {
@@ -56,6 +57,14 @@ function isPrivateAddress(address: string) {
   return true;
 }
 
+function isBlockedHostname(hostname: string) {
+  return (
+    BLOCKED_HOSTNAMES.has(hostname) ||
+    hostname.endsWith('.local') ||
+    hostname.endsWith('.internal')
+  );
+}
+
 export async function assertSafeRemoteUrl(rawUrl: string): Promise<URL> {
   const url = new URL(rawUrl);
 
@@ -65,11 +74,7 @@ export async function assertSafeRemoteUrl(rawUrl: string): Promise<URL> {
 
   const hostname = url.hostname.toLowerCase();
 
-  if (
-    BLOCKED_HOSTNAMES.has(hostname) ||
-    hostname.endsWith('.local') ||
-    hostname.endsWith('.internal')
-  ) {
+  if (isBlockedHostname(hostname)) {
     throw new Error('不允许访问本地或内网地址');
   }
 
@@ -88,4 +93,58 @@ export async function assertSafeRemoteUrl(rawUrl: string): Promise<URL> {
   }
 
   return url;
+}
+
+export async function resolveSafeAddress(rawUrl: string): Promise<{ url: URL; address: string; family: 4 | 6 }> {
+  const url = await assertSafeRemoteUrl(rawUrl);
+  const hostname = url.hostname.toLowerCase();
+
+  if (isIP(hostname)) {
+    return { url, address: hostname, family: isIP(hostname) as 4 | 6 };
+  }
+
+  const addresses = await lookup(hostname, { all: true, verbatim: true });
+  const safe = addresses.find((item) => !isPrivateAddress(item.address));
+
+  if (!safe) {
+    throw new Error('不允许访问本地或内网地址');
+  }
+
+  return { url, address: safe.address, family: safe.family as 4 | 6 };
+}
+
+export function createSafeLookup() {
+  const lookupFn: any = (hostname: string, options: any, callback: any) => {
+    const opts = typeof options === 'function' ? {} : options || {};
+    const cb = typeof options === 'function' ? options : callback;
+
+    if (isBlockedHostname(hostname.toLowerCase())) {
+      cb(new Error('不允许访问本地或内网地址'));
+      return;
+    }
+
+    const numericOpts = typeof opts === 'number' ? { family: opts } : opts;
+    dnsLookup(hostname, { ...numericOpts, all: true, verbatim: true }, (err, addresses) => {
+      if (err) {
+        cb(err);
+        return;
+      }
+
+      const list = (Array.isArray(addresses) ? addresses : [{ address: addresses as unknown as string, family: 4 }]) as LookupAddress[];
+
+      if (list.length === 0 || list.some((item) => isPrivateAddress(item.address))) {
+        cb(new Error('不允许访问本地或内网地址'));
+        return;
+      }
+
+      if (numericOpts.all) {
+        cb(null, list);
+        return;
+      }
+
+      const first = list[0];
+      cb(null, first.address, first.family);
+    });
+  };
+  return lookupFn;
 }

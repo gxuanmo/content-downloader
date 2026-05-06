@@ -3,17 +3,27 @@ import sanitizeFilename from 'sanitize-filename';
 import { Agent } from 'undici';
 
 import { downloadWithCurl } from '@/lib/server/curl-download';
-import { assertSafeRemoteUrl } from '@/lib/server/remote-url';
+import { assertSafeRemoteUrl, createSafeLookup } from '@/lib/server/remote-url';
 import { PlatformType } from '@/types';
 
 export const runtime = 'nodejs';
 
+const MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024;
+const MAX_REDIRECTS = 5;
+
 const downloadDispatcher = new Agent({
   connect: {
     timeout: 30000,
-    family: 4,
+    lookup: createSafeLookup(),
   },
 });
+
+class HtmlResponseError extends Error {
+  constructor() {
+    super('上游返回的是 HTML 页面，不是可下载的媒体文件');
+    this.name = 'HtmlResponseError';
+  }
+}
 
 const PLATFORM_REFERERS: Partial<Record<PlatformType, string>> = {
   bilibili: 'https://www.bilibili.com/',
@@ -60,11 +70,42 @@ function buildAttachmentFilename(filename: string) {
   };
 }
 
-async function fetchWithFallback(url: URL, platform: PlatformType, contentTypeHint: string) {
-  try {
+function limitedStream(source: ReadableStream<Uint8Array>, limit: number): ReadableStream<Uint8Array> {
+  let received = 0;
+  const reader = source.getReader();
+
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { value, done } = await reader.read();
+        if (done) {
+          controller.close();
+          return;
+        }
+        received += value.byteLength;
+        if (received > limit) {
+          controller.error(new Error(`下载体积超过限制 (${limit} 字节)`));
+          await reader.cancel();
+          return;
+        }
+        controller.enqueue(value);
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      await reader.cancel(reason);
+    },
+  });
+}
+
+async function fetchFollowingRedirects(initialUrl: URL, platform: PlatformType) {
+  let currentUrl = initialUrl;
+
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop += 1) {
     const requestInit: RequestInit & { dispatcher: Agent } = {
       method: 'GET',
-      redirect: 'follow',
+      redirect: 'manual',
       cache: 'no-store',
       dispatcher: downloadDispatcher,
       headers: {
@@ -74,31 +115,67 @@ async function fetchWithFallback(url: URL, platform: PlatformType, contentTypeHi
       },
     };
 
-    const response = await fetch(url, requestInit);
+    const response = await fetch(currentUrl, requestInit);
+
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get('location');
+      if (!location) {
+        throw new Error(`上游返回 ${response.status} 但缺少 Location 头`);
+      }
+
+      const nextUrl = new URL(location, currentUrl);
+      currentUrl = await assertSafeRemoteUrl(nextUrl.toString());
+      try {
+        await response.body?.cancel();
+      } catch {}
+      continue;
+    }
 
     if (!response.ok || !response.body) {
       throw new Error(`下载失败 (${response.status})`);
     }
 
-    const contentType = response.headers.get('content-type') || contentTypeHint;
+    return response;
+  }
 
+  throw new Error('重定向次数超过限制');
+}
+
+async function fetchWithFallback(url: URL, platform: PlatformType, contentTypeHint: string) {
+  try {
+    const response = await fetchFollowingRedirects(url, platform);
+
+    const contentType = response.headers.get('content-type') || contentTypeHint;
     if (contentType.toLowerCase().includes('text/html')) {
-      throw new Error('上游返回的是 HTML 页面，不是可下载的媒体文件');
+      throw new HtmlResponseError();
+    }
+
+    const contentLength = Number(response.headers.get('content-length') || '0');
+    if (contentLength > MAX_DOWNLOAD_BYTES) {
+      throw new Error(`下载体积超过限制 (${MAX_DOWNLOAD_BYTES} 字节)`);
     }
 
     return {
       kind: 'stream' as const,
-      body: response.body,
+      body: limitedStream(response.body!, MAX_DOWNLOAD_BYTES),
       contentType,
     };
-  } catch {
-    const buffer = await downloadWithCurl(url.toString(), PLATFORM_REFERERS[platform]);
-
-    return {
-      kind: 'buffer' as const,
-      body: buffer,
-      contentType: contentTypeHint,
-    };
+  } catch (error) {
+    if (error instanceof HtmlResponseError) {
+      throw error;
+    }
+    try {
+      const buffer = await downloadWithCurl(url.toString(), PLATFORM_REFERERS[platform], MAX_DOWNLOAD_BYTES);
+      return {
+        kind: 'buffer' as const,
+        body: buffer,
+        contentType: contentTypeHint,
+      };
+    } catch (curlError) {
+      const primary = error instanceof Error ? error.message : String(error);
+      const fallback = curlError instanceof Error ? curlError.message : String(curlError);
+      throw new Error(`下载失败：${primary}；curl 兜底也失败：${fallback}`);
+    }
   }
 }
 

@@ -1,17 +1,28 @@
 import 'server-only';
 
+import { Agent } from 'undici';
 import { load } from 'cheerio';
 import TurndownService from 'turndown';
 
 import { detectPlatform } from '@/lib/utils/platform-detector';
 import { DownloadItem, PlatformType } from '@/types';
 
+import { assertSafeRemoteUrl, createSafeLookup } from './remote-url';
 import {
   extractWithYtDlp,
   pickYtDlpAuthor,
   pickYtDlpDownloadUrl,
   pickYtDlpThumbnail,
 } from './yt-dlp';
+
+const MAX_HTML_REDIRECTS = 5;
+
+const fetchDispatcher = new Agent({
+  connect: {
+    timeout: 30000,
+    lookup: createSafeLookup(),
+  },
+});
 
 const turndown = new TurndownService({
   headingStyle: 'atx',
@@ -33,7 +44,7 @@ const PLATFORM_HOST_ALLOWLIST: Record<Exclude<PlatformType, 'unknown'>, string[]
   kuaishou: ['www.kuaishou.com', 'kuaishou.com', 'v.kuaishou.com'],
   videohao: ['channels.weixin.qq.com'],
   tiktok: ['www.tiktok.com', 'tiktok.com', 'vm.tiktok.com', 'vt.tiktok.com'],
-  xiaohongshu: ['www.xiaohongshu.com', 'xiaohongshu.com', 'xhslink.com', 'www.xiaohongshu.com', 'www.rednote.com', 'rednote.com'],
+  xiaohongshu: ['www.xiaohongshu.com', 'xiaohongshu.com', 'xhslink.com', 'www.rednote.com', 'rednote.com'],
   wechat: ['mp.weixin.qq.com'],
   x: ['x.com', 'www.x.com', 'twitter.com', 'www.twitter.com'],
   youtube: ['www.youtube.com', 'youtube.com', 'youtu.be', 'm.youtube.com'],
@@ -146,25 +157,50 @@ function isAllowedUrl(url: string, platform: PlatformType): boolean {
     return false;
   }
 
-  const host = new URL(url).hostname.toLowerCase();
+  let host: string;
+  try {
+    host = new URL(url).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
   return PLATFORM_HOST_ALLOWLIST[platform].some((allowedHost) => host === allowedHost || host.endsWith(`.${allowedHost}`));
 }
 
 async function fetchHtml(url: string) {
-  const response = await fetch(url, {
-    headers: DEFAULT_HEADERS,
-    redirect: 'follow',
-    cache: 'no-store',
-  });
+  let currentUrl = await assertSafeRemoteUrl(url);
 
-  if (!response.ok) {
-    throw new Error(`页面请求失败 (${response.status})`);
+  for (let hop = 0; hop <= MAX_HTML_REDIRECTS; hop += 1) {
+    const response = await fetch(currentUrl, {
+      headers: DEFAULT_HEADERS,
+      redirect: 'manual',
+      cache: 'no-store',
+      // @ts-expect-error undici dispatcher
+      dispatcher: fetchDispatcher,
+    });
+
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get('location');
+      if (!location) {
+        throw new Error(`页面请求失败 (${response.status})`);
+      }
+      currentUrl = await assertSafeRemoteUrl(new URL(location, currentUrl).toString());
+      try {
+        await response.body?.cancel();
+      } catch {}
+      continue;
+    }
+
+    if (!response.ok) {
+      throw new Error(`页面请求失败 (${response.status})`);
+    }
+
+    return {
+      html: await response.text(),
+      finalUrl: currentUrl.toString(),
+    };
   }
 
-  return {
-    html: await response.text(),
-    finalUrl: response.url,
-  };
+  throw new Error('页面重定向次数超过限制');
 }
 
 function normalizeMaybeUrl(url: string | undefined, baseUrl: string): string | undefined {
@@ -228,13 +264,23 @@ function extractMediaUrl(html: string, $: ReturnType<typeof load>, finalUrl: str
   return undefined;
 }
 
+interface ZhihuPayload {
+  title?: string;
+  content?: string;
+  author?: { name?: string };
+  question?: { title?: string };
+}
+
+interface ZhihuApiResponse extends ZhihuPayload {
+  data?: ZhihuPayload[];
+}
+
 async function resolveZhihu(url: string): Promise<DownloadItem> {
   const articleMatch = url.match(/(?:article\/|zhuanlan\.zhihu\.com\/p\/|\/p\/)(\d+)/);
   const questionMatch = url.match(/question\/(\d+)/);
   const answerMatch = url.match(/answer\/(\d+)/);
 
   let apiUrl = '';
-  let data: any;
 
   if (articleMatch) {
     apiUrl = `https://www.zhihu.com/api/v4/articles/${articleMatch[1]}`;
@@ -259,12 +305,11 @@ async function resolveZhihu(url: string): Promise<DownloadItem> {
     throw new Error(`知乎内容请求失败 (${response.status})`);
   }
 
-  data = await response.json();
-
-  const payload = Array.isArray(data.data) ? data.data[0] : data;
-  const title = payload?.title || payload?.question?.title || '知乎内容';
-  const author = payload?.author?.name || '匿名用户';
-  const htmlContent = payload?.content || '';
+  const data = (await response.json()) as ZhihuApiResponse;
+  const payload: ZhihuPayload = Array.isArray(data.data) ? data.data[0] ?? {} : data;
+  const title = payload.title || payload.question?.title || '知乎内容';
+  const author = payload.author?.name || '匿名用户';
+  const htmlContent = payload.content || '';
   const markdown = turndown.turndown(htmlContent);
 
   return buildSuccessItem({
@@ -285,6 +330,7 @@ async function resolveXiaoyuzhou(url: string): Promise<DownloadItem> {
   const $ = load(html);
 
   const audioMatch = html.match(/"audio"\s*:\s*{[^}]*"sourceUrl"\s*:\s*"([^"]+)"/);
+  const audioUrl = normalizeMaybeUrl(audioMatch?.[1], finalUrl);
   const title =
     extractMeta($, 'meta[property="og:title"]') ||
     cleanText($('title').text()).replace(/\s*-\s*小宇宙\s*$/, '') ||
@@ -296,6 +342,23 @@ async function resolveXiaoyuzhou(url: string): Promise<DownloadItem> {
   const cover = normalizeMaybeUrl(extractMeta($, 'meta[property="og:image"]'), finalUrl);
   const durationMatch = html.match(/"duration"\s*:\s*(\d+)/);
   const podcastMatch = html.match(/"podcastName"\s*:\s*"([^"]+)"/);
+  const duration = formatDuration(durationMatch ? Number(durationMatch[1]) : undefined);
+
+  if (!audioUrl) {
+    return buildSuccessItem({
+      platform: 'xiaoyuzhou',
+      url,
+      title,
+      author: podcastMatch?.[1],
+      thumbnail: cover,
+      content: buildMarkdownDocument(title, description || '当前页面未暴露可直接下载的音频链接。', podcastMatch?.[1], finalUrl),
+      duration,
+      summary: toSummary(description),
+      extension: 'md',
+      fileType: 'markdown',
+      source: 'html',
+    });
+  }
 
   return buildSuccessItem({
     platform: 'xiaoyuzhou',
@@ -303,10 +366,10 @@ async function resolveXiaoyuzhou(url: string): Promise<DownloadItem> {
     title,
     author: podcastMatch?.[1],
     thumbnail: cover,
-    downloadUrl: normalizeMaybeUrl(audioMatch?.[1], finalUrl),
-    duration: formatDuration(durationMatch ? Number(durationMatch[1]) : undefined),
+    downloadUrl: audioUrl,
+    duration,
     summary: toSummary(description),
-    extension: inferExtensionFromUrl(normalizeMaybeUrl(audioMatch?.[1], finalUrl)) || 'mp3',
+    extension: inferExtensionFromUrl(audioUrl) || 'mp3',
     fileType: 'audio',
     source: 'html',
   });
@@ -397,6 +460,16 @@ async function resolvePageFallback(url: string, platform: PlatformType): Promise
   });
 }
 
+const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'webp', 'gif']);
+const AUDIO_EXTENSIONS = new Set(['mp3', 'm4a', 'aac', 'wav', 'ogg', 'flac']);
+
+function classifyMedia(extension: string | undefined): { extension: string; fileType: DownloadItem['fileType'] } {
+  const ext = (extension || '').toLowerCase();
+  if (IMAGE_EXTENSIONS.has(ext)) return { extension: ext, fileType: 'image' };
+  if (AUDIO_EXTENSIONS.has(ext)) return { extension: ext, fileType: 'audio' };
+  return { extension: ext || 'mp4', fileType: 'video' };
+}
+
 async function resolveViaYtDlp(url: string, platform: PlatformType): Promise<DownloadItem> {
   const entry = await extractWithYtDlp(url);
   const title = entry.title || '内容解析结果';
@@ -407,6 +480,9 @@ async function resolveViaYtDlp(url: string, platform: PlatformType): Promise<Dow
   const summary = toSummary(entry.description);
 
   if (downloadUrl && downloadUrl !== entry.webpage_url) {
+    const inferredExt = entry.ext || inferExtensionFromUrl(downloadUrl);
+    const media = classifyMedia(inferredExt);
+
     return buildSuccessItem({
       platform,
       url,
@@ -416,8 +492,8 @@ async function resolveViaYtDlp(url: string, platform: PlatformType): Promise<Dow
       downloadUrl,
       duration,
       summary,
-      extension: entry.ext || inferExtensionFromUrl(downloadUrl) || (entry.ext && ['jpg', 'jpeg', 'png', 'webp'].includes(entry.ext) ? entry.ext : 'mp4'),
-      fileType: entry.ext && ['jpg', 'jpeg', 'png', 'webp'].includes(entry.ext) ? 'image' : 'video',
+      extension: media.extension,
+      fileType: media.fileType,
       source: 'yt-dlp',
     });
   }
@@ -437,15 +513,22 @@ async function resolveViaYtDlp(url: string, platform: PlatformType): Promise<Dow
   });
 }
 
+export class ResolveValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ResolveValidationError';
+  }
+}
+
 export async function resolveDownloadItem(url: string): Promise<DownloadItem> {
   const platform = detectPlatform(url);
 
   if (platform === 'unknown') {
-    throw new Error('暂不支持该平台链接');
+    throw new ResolveValidationError('暂不支持该平台链接');
   }
 
   if (!isAllowedUrl(url, platform)) {
-    throw new Error('链接域名与平台不匹配');
+    throw new ResolveValidationError('链接域名与平台不匹配');
   }
 
   switch (platform) {
