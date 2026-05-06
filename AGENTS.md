@@ -15,11 +15,10 @@ npm run dev          # 启动开发服务器 http://localhost:3000
 npm run build        # 生产构建
 npm run start        # 启动生产服务器
 
-# 代码检查
-npm run lint         # ESLint 检查
-
 # TypeScript 检查
 npx tsc --noEmit     # 类型检查不输出
+
+# 注：当前仓库没有独立配置 ESLint，next build 已包含内置 lint 阶段。
 ```
 
 ## 项目结构

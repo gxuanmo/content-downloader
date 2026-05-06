@@ -231,6 +231,12 @@ export async function POST(request: NextRequest) {
         { status: 400 }
       );
     }
+    if (error instanceof SyntaxError) {
+      return NextResponse.json(
+        { success: false, error: '请求体不是有效的 JSON' },
+        { status: 400 }
+      );
+    }
     const message =
       error instanceof Error
         ? [error.message, error.cause instanceof Error ? error.cause.message : '']

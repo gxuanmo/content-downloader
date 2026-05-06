@@ -42,6 +42,13 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({ success: true, data: results });
   } catch (error) {
+    if (error instanceof SyntaxError) {
+      return NextResponse.json(
+        { success: false, error: '请求体不是有效的 JSON' },
+        { status: 400 }
+      );
+    }
+
     const message = error instanceof Error ? error.message : '服务器内部错误';
     return NextResponse.json(
       { success: false, error: message },
