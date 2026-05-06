@@ -28,9 +28,14 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    const BATCH_INTERVAL_MS = 300;
     const results = [];
 
-    for (const url of urls) {
+    for (let index = 0; index < urls.length; index += 1) {
+      if (index > 0) {
+        await new Promise((resolve) => setTimeout(resolve, BATCH_INTERVAL_MS));
+      }
+      const url = urls[index];
       try {
         const item = await resolveDownloadItem(url);
         results.push(item);

@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useEffect, useMemo, useState } from 'react';
+import Image from 'next/image';
 import {
   AlertCircle,
   CheckCircle2,
@@ -421,10 +422,13 @@ export default function Home() {
                 >
                   <div className="flex items-start gap-4">
                     {item.thumbnail && (
-                      <img
+                      <Image
                         src={item.thumbnail}
                         alt={item.title}
+                        width={96}
+                        height={64}
                         className="h-16 w-24 rounded-md object-cover"
+                        unoptimized
                       />
                     )}
                     <div className="min-w-0 flex-1">
