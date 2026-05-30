@@ -38,7 +38,7 @@ lib/
   platforms/
     resolver.ts      # 客户端调用 /api/resolve 的薄封装
   server/
-    resolver.ts      # 各平台分发：知乎 API、公众号/小宇宙 HTML、yt-dlp 子进程、HTML 兜底
+    resolver.ts      # 各平台分发：知乎 HTML+cookie、公众号/小宇宙 HTML、yt-dlp 子进程、HTML 兜底
     yt-dlp.ts        # 调 python -m yt_dlp
     curl-download.ts # curl 兜底下载（不跟随重定向，带体积上限）
     remote-url.ts    # SSRF 校验：协议/域名/IP/DNS 都校验
@@ -49,7 +49,16 @@ lib/
     zip.ts           # JSZip 打包
 
 types/               # 共享类型
+
+tests/                # 单元测试（Vitest）
 ```
+
+## 环境变量
+
+| 变量 | 必填 | 说明 |
+|------|------|------|
+| `ZHIHU_COOKIE` | 知乎解析必填 | 浏览器登录知乎后 F12 → Application → Cookies 复制 |
+| `DOUYIN_COOKIE` | 抖音解析必填（计划中） | 同上，抖音 yt-dlp 需新鲜 cookie |
 
 ## Code Style Guidelines
 

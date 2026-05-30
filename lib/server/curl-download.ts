@@ -75,7 +75,11 @@ function runCurl(
       received += chunk.byteLength;
       if (received > maxBytes) {
         try {
-          child.kill('SIGKILL');
+          if (process.platform === 'win32' && child.pid) {
+            spawn('taskkill', ['/pid', String(child.pid), '/f', '/t'], { windowsHide: true });
+          } else {
+            child.kill('SIGKILL');
+          }
         } catch {}
         finish(() => reject(new Error(`下载体积超过限制 (${maxBytes} 字节)`)));
         return;
@@ -108,7 +112,10 @@ function runCurl(
           const ctMatch = line.match(/^content-type:\s*(.+)$/i);
           if (ctMatch) contentType = ctMatch[1].trim();
         }
-      } catch {}
+      } catch {
+        finish(() => reject(new Error(`无法读取 curl 响应头文件: ${headerFile}`)));
+        return;
+      }
       finish(() =>
         resolve({
           buffer: Buffer.concat(chunks),
@@ -127,7 +134,9 @@ export async function downloadWithCurl(
 ): Promise<Buffer> {
   const { url, address } = await resolveSafeAddress(rawUrl);
   const port = url.port || (url.protocol === 'https:' ? '443' : '80');
-  const resolveOverride = `${url.hostname}:${port}:${address}`;
+  // curl --resolve 要求 IPv6 地址用方括号包裹，否则冒号分隔歧义导致解析失败
+  const ipLiteral = address.includes(':') ? `[${address}]` : address;
+  const resolveOverride = `${url.hostname}:${port}:${ipLiteral}`;
 
   const tempDir = await mkdtemp(join(tmpdir(), 'content-downloader-'));
   const headerFile = join(tempDir, 'headers.txt');
