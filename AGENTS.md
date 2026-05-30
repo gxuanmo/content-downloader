@@ -3,7 +3,7 @@
 ## Project Overview
 
 Next.js 14 (App Router) + TypeScript + Tailwind CSS + shadcn/ui 内容下载器
-支持平台：知乎、小宇宙、B站
+支持平台：抖音、快手、视频号、TikTok、小红书、X、Bilibili、YouTube、小宇宙、公众号、知乎
 
 ## Build/Lint Commands
 
@@ -15,39 +15,50 @@ npm run dev          # 启动开发服务器 http://localhost:3000
 npm run build        # 生产构建
 npm run start        # 启动生产服务器
 
-# 代码检查
-npm run lint         # ESLint 检查
-
 # TypeScript 检查
 npx tsc --noEmit     # 类型检查不输出
+
+# 注：当前仓库没有独立配置 ESLint，next build 已包含内置 lint 阶段。
 ```
 
 ## 项目结构
 
 ```
 app/
-  api/               # API 路由（Serverless Functions）
-    bilibili/        # B站解析 API
-    xiaoyuzhou/      # 小宇宙解析 API
-    zhihu/           # 知乎解析 API
-  page.tsx           # 主页面
-  layout.tsx         # 根布局
-  globals.css        # 全局样式
+  api/
+    resolve/         # 单条/批量统一解析（POST /api/resolve、/api/resolve/batch）
+    download/        # 媒体下载代理（带 SSRF 与重定向防护、体积上限）
+  page.tsx           # 主页面（单条/批量、平台识别、历史、ZIP 导出）
+  layout.tsx
+  globals.css
 
 components/ui/       # shadcn/ui 组件
 
 lib/
-  platforms/         # 平台解析逻辑
-    bilibili.ts
-    xiaoyuzhou.ts
-    zhihu.ts
-  utils/             # 工具函数
+  platforms/
+    resolver.ts      # 客户端调用 /api/resolve 的薄封装
+  server/
+    resolver.ts      # 各平台分发：知乎 HTML+cookie、公众号/小宇宙 HTML、yt-dlp 子进程、HTML 兜底
+    yt-dlp.ts        # 调 python -m yt_dlp
+    curl-download.ts # curl 兜底下载（不跟随重定向，带体积上限）
+    remote-url.ts    # SSRF 校验：协议/域名/IP/DNS 都校验
+  utils/
     platform-detector.ts
-    storage.ts       # LocalStorage
-    zip.ts           # ZIP打包
+    download.ts      # 客户端下载/远端拉取
+    storage.ts       # localStorage 历史
+    zip.ts           # JSZip 打包
 
-types/               # TypeScript 类型定义
+types/               # 共享类型
+
+tests/                # 单元测试（Vitest）
 ```
+
+## 环境变量
+
+| 变量 | 必填 | 说明 |
+|------|------|------|
+| `ZHIHU_COOKIE` | 知乎解析必填 | 浏览器登录知乎后 F12 → Application → Cookies 复制 |
+| `DOUYIN_COOKIE` | 抖音解析必填（计划中） | 同上，抖音 yt-dlp 需新鲜 cookie |
 
 ## Code Style Guidelines
 

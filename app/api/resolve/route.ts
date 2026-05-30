@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 
-import { resolveDownloadItem } from '@/lib/server/resolver';
+import { ResolveValidationError, resolveDownloadItem } from '@/lib/server/resolver';
 
 export const runtime = 'nodejs';
 
@@ -19,6 +19,20 @@ export async function POST(request: NextRequest) {
     const item = await resolveDownloadItem(url);
     return NextResponse.json({ success: true, data: item });
   } catch (error) {
+    if (error instanceof ResolveValidationError) {
+      return NextResponse.json(
+        { success: false, error: error.message },
+        { status: 400 }
+      );
+    }
+
+    if (error instanceof SyntaxError) {
+      return NextResponse.json(
+        { success: false, error: '请求体不是有效的 JSON' },
+        { status: 400 }
+      );
+    }
+
     const message = error instanceof Error ? error.message : '服务器内部错误';
     return NextResponse.json(
       { success: false, error: message },

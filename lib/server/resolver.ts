@@ -1,17 +1,31 @@
 import 'server-only';
 
+import { Agent } from 'undici';
 import { load } from 'cheerio';
 import TurndownService from 'turndown';
 
 import { detectPlatform } from '@/lib/utils/platform-detector';
 import { DownloadItem, PlatformType } from '@/types';
 
+import { assertSafeRemoteUrl, createSafeLookup } from './remote-url';
 import {
   extractWithYtDlp,
   pickYtDlpAuthor,
   pickYtDlpDownloadUrl,
   pickYtDlpThumbnail,
 } from './yt-dlp';
+
+const MAX_HTML_REDIRECTS = 5;
+const MAX_HTML_BYTES = 8 * 1024 * 1024;
+const MAX_JSON_BYTES = 2 * 1024 * 1024;
+const FETCH_TIMEOUT_MS = 12_000;
+
+const fetchDispatcher = new Agent({
+  connect: {
+    timeout: FETCH_TIMEOUT_MS,
+    lookup: createSafeLookup(),
+  },
+});
 
 const turndown = new TurndownService({
   headingStyle: 'atx',
@@ -33,7 +47,7 @@ const PLATFORM_HOST_ALLOWLIST: Record<Exclude<PlatformType, 'unknown'>, string[]
   kuaishou: ['www.kuaishou.com', 'kuaishou.com', 'v.kuaishou.com'],
   videohao: ['channels.weixin.qq.com'],
   tiktok: ['www.tiktok.com', 'tiktok.com', 'vm.tiktok.com', 'vt.tiktok.com'],
-  xiaohongshu: ['www.xiaohongshu.com', 'xiaohongshu.com', 'xhslink.com', 'www.xiaohongshu.com', 'www.rednote.com', 'rednote.com'],
+  xiaohongshu: ['www.xiaohongshu.com', 'xiaohongshu.com', 'xhslink.com', 'www.rednote.com', 'rednote.com'],
   wechat: ['mp.weixin.qq.com'],
   x: ['x.com', 'www.x.com', 'twitter.com', 'www.twitter.com'],
   youtube: ['www.youtube.com', 'youtube.com', 'youtu.be', 'm.youtube.com'],
@@ -146,25 +160,130 @@ function isAllowedUrl(url: string, platform: PlatformType): boolean {
     return false;
   }
 
-  const host = new URL(url).hostname.toLowerCase();
+  let host: string;
+  try {
+    host = new URL(url).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
   return PLATFORM_HOST_ALLOWLIST[platform].some((allowedHost) => host === allowedHost || host.endsWith(`.${allowedHost}`));
 }
 
-async function fetchHtml(url: string) {
-  const response = await fetch(url, {
-    headers: DEFAULT_HEADERS,
-    redirect: 'follow',
-    cache: 'no-store',
-  });
+async function discardResponseBody(response: Response) {
+  try {
+    await response.body?.cancel();
+  } catch {}
+}
 
-  if (!response.ok) {
-    throw new Error(`页面请求失败 (${response.status})`);
+async function readBodyWithLimit(response: Response, limit: number): Promise<string> {
+  const declared = Number(response.headers.get('content-length') || '0');
+  if (declared > limit) {
+    await discardResponseBody(response);
+    throw new Error(`上游响应体积超过限制 (${limit} 字节)`);
   }
 
-  return {
-    html: await response.text(),
-    finalUrl: response.url,
-  };
+  if (!response.body) {
+    return '';
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder('utf-8', { fatal: false });
+  let received = 0;
+  let result = '';
+
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) {
+        result += decoder.decode();
+        return result;
+      }
+      received += value.byteLength;
+      if (received > limit) {
+        try {
+          await reader.cancel();
+        } catch {}
+        throw new Error(`上游响应体积超过限制 (${limit} 字节)`);
+      }
+      result += decoder.decode(value, { stream: true });
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {}
+  }
+}
+
+async function fetchHtml(
+  url: string,
+  platform?: Exclude<PlatformType, 'unknown'>,
+  extraHeaders?: Record<string, string>,
+) {
+  let currentUrl = await assertSafeRemoteUrl(url);
+
+  for (let hop = 0; hop <= MAX_HTML_REDIRECTS; hop += 1) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+    let response: Response;
+    try {
+      response = await fetch(currentUrl, {
+        headers: { ...DEFAULT_HEADERS, ...extraHeaders },
+        redirect: 'manual',
+        cache: 'no-store',
+        signal: controller.signal,
+        // @ts-expect-error undici dispatcher
+        dispatcher: fetchDispatcher,
+      });
+    } catch (error) {
+      clearTimeout(timeoutId);
+      if (
+        error instanceof DOMException ||
+        (error instanceof Error && error.name === 'AbortError')
+      ) {
+        throw new Error(`页面请求超时 (${FETCH_TIMEOUT_MS / 1000}s)`);
+      }
+      throw error;
+    }
+
+    if (response.status >= 300 && response.status < 400) {
+      clearTimeout(timeoutId);
+      const location = response.headers.get('location');
+      if (!location) {
+        await discardResponseBody(response);
+        throw new Error(`页面请求失败 (${response.status})`);
+      }
+      let nextUrl: URL;
+      try {
+        nextUrl = await assertSafeRemoteUrl(new URL(location, currentUrl).toString());
+      } catch (error) {
+        await discardResponseBody(response);
+        throw error;
+      }
+      if (platform && !isAllowedUrl(nextUrl.toString(), platform)) {
+        await discardResponseBody(response);
+        throw new Error('重定向目标不在该平台允许的域名列表内');
+      }
+      currentUrl = nextUrl;
+      await discardResponseBody(response);
+      continue;
+    }
+
+    if (!response.ok) {
+      clearTimeout(timeoutId);
+      await discardResponseBody(response);
+      throw new Error(`页面请求失败 (${response.status})`);
+    }
+
+    const html = await readBodyWithLimit(response, MAX_HTML_BYTES);
+    clearTimeout(timeoutId);
+    return {
+      html,
+      finalUrl: currentUrl.toString(),
+    };
+  }
+
+  throw new Error('页面重定向次数超过限制');
 }
 
 function normalizeMaybeUrl(url: string | undefined, baseUrl: string): string | undefined {
@@ -228,63 +347,118 @@ function extractMediaUrl(html: string, $: ReturnType<typeof load>, finalUrl: str
   return undefined;
 }
 
+function getZhihuCookie(): string | undefined {
+  const raw = process.env.ZHIHU_COOKIE;
+  if (!raw) return undefined;
+  const trimmed = raw.trim();
+  return trimmed || undefined;
+}
+
 async function resolveZhihu(url: string): Promise<DownloadItem> {
   const articleMatch = url.match(/(?:article\/|zhuanlan\.zhihu\.com\/p\/|\/p\/)(\d+)/);
   const questionMatch = url.match(/question\/(\d+)/);
   const answerMatch = url.match(/answer\/(\d+)/);
 
-  let apiUrl = '';
-  let data: any;
-
-  if (articleMatch) {
-    apiUrl = `https://www.zhihu.com/api/v4/articles/${articleMatch[1]}`;
-  } else if (questionMatch && answerMatch) {
-    apiUrl = `https://www.zhihu.com/api/v4/answers/${answerMatch[1]}?include=content,question,author`;
-  } else if (questionMatch) {
-    apiUrl = `https://www.zhihu.com/api/v4/questions/${questionMatch[1]}/answers?limit=1&offset=0&include=content,question,author`;
-  } else {
+  if (!articleMatch && !questionMatch) {
     throw new Error('暂不支持该知乎链接格式');
   }
 
-  const response = await fetch(apiUrl, {
-    headers: {
-      ...DEFAULT_HEADERS,
-      Accept: 'application/json',
-      Referer: 'https://www.zhihu.com/',
-    },
-    cache: 'no-store',
-  });
-
-  if (!response.ok) {
-    throw new Error(`知乎内容请求失败 (${response.status})`);
+  const cookie = getZhihuCookie();
+  if (!cookie) {
+    throw new ResolveValidationError(
+      '知乎需要登录后才能抓取内容。请设置环境变量 ZHIHU_COOKIE=你的知乎Cookie 后重试。' +
+        '获取方式：浏览器登录知乎 → F12 → Application → Cookies → 复制所有 cookie 值',
+    );
   }
 
-  data = await response.json();
+  const extraHeaders: Record<string, string> = { Cookie: cookie };
 
-  const payload = Array.isArray(data.data) ? data.data[0] : data;
-  const title = payload?.title || payload?.question?.title || '知乎内容';
-  const author = payload?.author?.name || '匿名用户';
-  const htmlContent = payload?.content || '';
-  const markdown = turndown.turndown(htmlContent);
+  let pageUrl = url;
+  if (answerMatch) {
+    if (!questionMatch) {
+      throw new Error('暂不支持该知乎回答链接格式，请使用包含问题 ID 的完整链接');
+    }
+    pageUrl = `https://www.zhihu.com/question/${questionMatch[1]}/answer/${answerMatch[1]}`;
+  } else if (questionMatch) {
+    pageUrl = `https://www.zhihu.com/question/${questionMatch[1]}`;
+  }
+
+  let html: string;
+  let finalUrl: string;
+  try {
+    const result = await fetchHtml(pageUrl, 'zhihu', extraHeaders);
+    html = result.html;
+    finalUrl = result.finalUrl;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes('403') || message.includes('超时')) {
+      throw new ResolveValidationError(
+        '知乎页面访问失败，可能是 Cookie 已过期。请重新获取并设置 ZHIHU_COOKIE 环境变量。' +
+          '获取方式：浏览器登录知乎 → F12 → Application → Cookies → 复制所有 cookie 值',
+      );
+    }
+    throw error;
+  }
+  const $ = load(html);
+
+  $('script, style, noscript').remove();
+
+  let title = '';
+  let author: string | undefined;
+  let htmlContent = '';
+
+  if (articleMatch) {
+    title =
+      cleanText($('.Post-Title').first().text()) ||
+      cleanText($('h1.Post-Title').first().text()) ||
+      cleanText($('title').text().replace(/\s*[-–—|]\s*知乎.*$/, ''));
+    author =
+      cleanText($('.AuthorInfo-name').first().text()) ||
+      cleanText($('[itemprop="author"]').attr('content')) ||
+      undefined;
+    htmlContent = $('.RichText').first().html() || $('.Post-RichText').first().html() || '';
+  } else {
+    title =
+      cleanText($('.QuestionHeader-title').first().text()) ||
+      cleanText($('h1.QuestionHeader-title').first().text()) ||
+      cleanText($('title').text().replace(/\s*[-–—|]\s*知乎.*$/, ''));
+    author =
+      cleanText($('.AuthorInfo-name').first().text()) ||
+      cleanText($('[itemprop="author"]').attr('content')) ||
+      undefined;
+    htmlContent =
+      $('.RichContent-inner').first().html() ||
+      $('.AnswerItem .RichText').first().html() ||
+      $('.RichText').first().html() ||
+      '';
+  }
+  if (!htmlContent) {
+    throw new Error('知乎页面抓取失败，请检查 ZHIHU_COOKIE 是否有效');
+  }
+
+  const markdownBody = htmlContent ? turndown.turndown(htmlContent) : '';
+  const finalTitle = title || '知乎内容';
+  const finalAuthor = author || undefined;
 
   return buildSuccessItem({
     platform: 'zhihu',
     url,
-    title,
-    author,
-    content: markdown || buildMarkdownDocument(title, undefined, author, url),
-    summary: toSummary(markdown),
+    title: finalTitle,
+    author: finalAuthor,
+    content: buildMarkdownDocument(finalTitle, markdownBody, finalAuthor, finalUrl),
+    summary: toSummary(markdownBody || title || undefined),
     extension: 'md',
     fileType: 'markdown',
-    source: 'api',
+    source: 'html',
   });
 }
 
 async function resolveXiaoyuzhou(url: string): Promise<DownloadItem> {
-  const { html, finalUrl } = await fetchHtml(url);
+  const { html, finalUrl } = await fetchHtml(url, 'xiaoyuzhou');
   const $ = load(html);
 
   const audioMatch = html.match(/"audio"\s*:\s*{[^}]*"sourceUrl"\s*:\s*"([^"]+)"/);
+  const audioUrl = normalizeMaybeUrl(audioMatch?.[1], finalUrl);
   const title =
     extractMeta($, 'meta[property="og:title"]') ||
     cleanText($('title').text()).replace(/\s*-\s*小宇宙\s*$/, '') ||
@@ -296,6 +470,23 @@ async function resolveXiaoyuzhou(url: string): Promise<DownloadItem> {
   const cover = normalizeMaybeUrl(extractMeta($, 'meta[property="og:image"]'), finalUrl);
   const durationMatch = html.match(/"duration"\s*:\s*(\d+)/);
   const podcastMatch = html.match(/"podcastName"\s*:\s*"([^"]+)"/);
+  const duration = formatDuration(durationMatch ? Number(durationMatch[1]) : undefined);
+
+  if (!audioUrl) {
+    return buildSuccessItem({
+      platform: 'xiaoyuzhou',
+      url,
+      title,
+      author: podcastMatch?.[1],
+      thumbnail: cover,
+      content: buildMarkdownDocument(title, description || '当前页面未暴露可直接下载的音频链接。', podcastMatch?.[1], finalUrl),
+      duration,
+      summary: toSummary(description),
+      extension: 'md',
+      fileType: 'markdown',
+      source: 'html',
+    });
+  }
 
   return buildSuccessItem({
     platform: 'xiaoyuzhou',
@@ -303,17 +494,17 @@ async function resolveXiaoyuzhou(url: string): Promise<DownloadItem> {
     title,
     author: podcastMatch?.[1],
     thumbnail: cover,
-    downloadUrl: normalizeMaybeUrl(audioMatch?.[1], finalUrl),
-    duration: formatDuration(durationMatch ? Number(durationMatch[1]) : undefined),
+    downloadUrl: audioUrl,
+    duration,
     summary: toSummary(description),
-    extension: inferExtensionFromUrl(normalizeMaybeUrl(audioMatch?.[1], finalUrl)) || 'mp3',
+    extension: inferExtensionFromUrl(audioUrl) || 'mp3',
     fileType: 'audio',
     source: 'html',
   });
 }
 
 async function resolveWechatArticle(url: string): Promise<DownloadItem> {
-  const { html, finalUrl } = await fetchHtml(url);
+  const { html, finalUrl } = await fetchHtml(url, 'wechat');
   const $ = load(html);
 
   const contentRoot = $('#js_content').length ? $('#js_content') : $('.rich_media_content').first();
@@ -352,7 +543,10 @@ async function resolveWechatArticle(url: string): Promise<DownloadItem> {
 }
 
 async function resolvePageFallback(url: string, platform: PlatformType): Promise<DownloadItem> {
-  const { html, finalUrl } = await fetchHtml(url);
+  const { html, finalUrl } = await fetchHtml(
+    url,
+    platform === 'unknown' ? undefined : platform
+  );
   const $ = load(html);
 
   const title =
@@ -397,6 +591,18 @@ async function resolvePageFallback(url: string, platform: PlatformType): Promise
   });
 }
 
+const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'webp', 'gif']);
+const AUDIO_EXTENSIONS = new Set(['mp3', 'm4a', 'aac', 'wav', 'ogg', 'flac']);
+
+function classifyMedia(extension: string | undefined): { extension: string; fileType: DownloadItem['fileType'] } {
+  const ext = (extension || '').toLowerCase();
+  if (IMAGE_EXTENSIONS.has(ext)) return { extension: ext, fileType: 'image' };
+  if (AUDIO_EXTENSIONS.has(ext)) return { extension: ext, fileType: 'audio' };
+  // 未知扩展名默认按视频处理。yt-dlp 支持的平台以视频为主，
+  // 图片平台（小红书图文）在 yt-dlp 失败后会走 HTML 兜底，不会进到这里。
+  return { extension: ext || 'mp4', fileType: 'video' };
+}
+
 async function resolveViaYtDlp(url: string, platform: PlatformType): Promise<DownloadItem> {
   const entry = await extractWithYtDlp(url);
   const title = entry.title || '内容解析结果';
@@ -407,6 +613,9 @@ async function resolveViaYtDlp(url: string, platform: PlatformType): Promise<Dow
   const summary = toSummary(entry.description);
 
   if (downloadUrl && downloadUrl !== entry.webpage_url) {
+    const inferredExt = entry.ext || inferExtensionFromUrl(downloadUrl);
+    const media = classifyMedia(inferredExt);
+
     return buildSuccessItem({
       platform,
       url,
@@ -416,8 +625,8 @@ async function resolveViaYtDlp(url: string, platform: PlatformType): Promise<Dow
       downloadUrl,
       duration,
       summary,
-      extension: entry.ext || inferExtensionFromUrl(downloadUrl) || (entry.ext && ['jpg', 'jpeg', 'png', 'webp'].includes(entry.ext) ? entry.ext : 'mp4'),
-      fileType: entry.ext && ['jpg', 'jpeg', 'png', 'webp'].includes(entry.ext) ? 'image' : 'video',
+      extension: media.extension,
+      fileType: media.fileType,
       source: 'yt-dlp',
     });
   }
@@ -437,15 +646,81 @@ async function resolveViaYtDlp(url: string, platform: PlatformType): Promise<Dow
   });
 }
 
+export class ResolveValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ResolveValidationError';
+  }
+}
+
+async function resolveXiaohongshuFallback(url: string): Promise<DownloadItem> {
+  const { html, finalUrl } = await fetchHtml(url, 'xiaohongshu');
+  const $ = load(html);
+
+  $('script, style, noscript').remove();
+
+  const title =
+    cleanText($('#detail-title').first().text()) ||
+    cleanText($('.title').first().text()) ||
+    extractMeta($, 'meta[property="og:title"]') ||
+    cleanText($('title').text()) ||
+    '小红书笔记';
+
+  const description =
+    cleanText($('#detail-desc').first().text()) ||
+    cleanText($('.desc').first().text()) ||
+    extractMeta($, 'meta[property="og:description"]') ||
+    extractMeta($, 'meta[name="description"]') ||
+    '';
+
+  const images = $('.swiper-slide img, .note-image img, .slide img, img[src*="sns-webpic"]')
+    .map((_, el) => $(el).attr('src'))
+    .get()
+    .filter((s): s is string => Boolean(s))
+    .map((src) => normalizeMaybeUrl(src, finalUrl))
+    .filter((s): s is string => Boolean(s));
+
+  const author =
+    cleanText($('.username').first().text()) ||
+    cleanText($('.author .name').first().text()) ||
+    undefined;
+
+  const thumbnail = normalizeMaybeUrl(extractMeta($, 'meta[property="og:image"]'), finalUrl);
+
+  const markdownBody = [
+    description,
+    images.length > 0 ? `\n\n> 共 ${images.length} 张图片` : '',
+    ...images.map((src, i) => `\n![](${src})`),
+  ].join('');
+
+  // Fail if neither description nor images were extracted — likely client-rendered or blocked
+  if (!description && images.length === 0) {
+    throw new Error('小红书笔记内容抓取失败，页面可能需要登录或已改版');
+  }
+
+  return buildSuccessItem({
+    platform: 'xiaohongshu',
+    url,
+    title,
+    author,
+    thumbnail,
+    content: buildMarkdownDocument(title, markdownBody, author, finalUrl),
+    summary: toSummary(description) || `小红书图文笔记，含 ${images.length} 张图片`,
+    extension: 'md',
+    fileType: 'markdown',
+    source: 'html',
+  });
+}
+
 export async function resolveDownloadItem(url: string): Promise<DownloadItem> {
   const platform = detectPlatform(url);
 
   if (platform === 'unknown') {
-    throw new Error('暂不支持该平台链接');
+    throw new ResolveValidationError('暂不支持该平台链接');
   }
 
   if (!isAllowedUrl(url, platform)) {
-    throw new Error('链接域名与平台不匹配');
+    throw new ResolveValidationError('链接域名与平台不匹配');
   }
 
   switch (platform) {
@@ -460,7 +735,14 @@ export async function resolveDownloadItem(url: string): Promise<DownloadItem> {
       return resolvePageFallback(url, platform);
     default:
       if (YT_DLP_PLATFORMS.has(platform)) {
-        return resolveViaYtDlp(url, platform);
+        try {
+          return await resolveViaYtDlp(url, platform);
+        } catch (error) {
+          if (platform === 'xiaohongshu') {
+            return resolveXiaohongshuFallback(url);
+          }
+          throw error;
+        }
       }
       return resolvePageFallback(url, platform);
   }

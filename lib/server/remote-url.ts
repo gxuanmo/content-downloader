@@ -1,6 +1,7 @@
 import 'server-only';
 
 import { lookup } from 'dns/promises';
+import { lookup as dnsLookup, type LookupAddress } from 'dns';
 import { isIP } from 'net';
 
 const BLOCKED_HOSTNAMES = new Set([
@@ -9,6 +10,13 @@ const BLOCKED_HOSTNAMES = new Set([
   '0.0.0.0',
   '::1',
 ]);
+
+export class RemoteUrlError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RemoteUrlError';
+  }
+}
 
 function isPrivateIpv4(address: string) {
   const parts = address.split('.').map((item) => Number(item));
@@ -30,19 +38,37 @@ function isPrivateIpv4(address: string) {
 function isPrivateIpv6(address: string) {
   const value = address.toLowerCase();
 
-  return (
-    value === '::1' ||
+  if (value === '::' || value === '::0' || value === '::1') {
+    return true;
+  }
+
+  if (
     value.startsWith('fc') ||
     value.startsWith('fd') ||
-    value.startsWith('fe80:') ||
-    value.startsWith('::ffff:127.') ||
-    value.startsWith('::ffff:10.') ||
-    value.startsWith('::ffff:192.168.') ||
-    /^::ffff:172\.(1[6-9]|2\d|3[0-1])\./.test(value)
-  );
+    value.startsWith('fe80:')
+  ) {
+    return true;
+  }
+
+  // ::ffff:a.b.c.d (IPv4-mapped) and ::a.b.c.d (IPv4-compatible) — both
+  // route to the underlying IPv4 destination on dual-stack kernels, so
+  // delegate to isPrivateIpv4 to cover IMDS (169.254.169.254), CGNAT,
+  // 0.0.0.0, etc.
+  const mapped = value.match(/^::(?:ffff:)?((?:\d{1,3}\.){3}\d{1,3})$/);
+  if (mapped) {
+    return isPrivateIpv4(mapped[1]);
+  }
+
+  // 64:ff9b::/96 — well-known NAT64 prefix; treated as private since the
+  // embedded IPv4 is opaque to us.
+  if (value.startsWith('64:ff9b:') || value.startsWith('64:ff9b::')) {
+    return true;
+  }
+
+  return false;
 }
 
-function isPrivateAddress(address: string) {
+export function isPrivateAddress(address: string) {
   const family = isIP(address);
 
   if (family === 4) {
@@ -56,26 +82,30 @@ function isPrivateAddress(address: string) {
   return true;
 }
 
+function isBlockedHostname(hostname: string) {
+  return (
+    BLOCKED_HOSTNAMES.has(hostname) ||
+    hostname.endsWith('.local') ||
+    hostname.endsWith('.internal')
+  );
+}
+
 export async function assertSafeRemoteUrl(rawUrl: string): Promise<URL> {
   const url = new URL(rawUrl);
 
   if (!['http:', 'https:'].includes(url.protocol)) {
-    throw new Error('仅支持 HTTP/HTTPS 下载链接');
+    throw new RemoteUrlError('仅支持 HTTP/HTTPS 下载链接');
   }
 
   const hostname = url.hostname.toLowerCase();
 
-  if (
-    BLOCKED_HOSTNAMES.has(hostname) ||
-    hostname.endsWith('.local') ||
-    hostname.endsWith('.internal')
-  ) {
-    throw new Error('不允许访问本地或内网地址');
+  if (isBlockedHostname(hostname)) {
+    throw new RemoteUrlError('不允许访问本地或内网地址');
   }
 
   if (isIP(hostname)) {
     if (isPrivateAddress(hostname)) {
-      throw new Error('不允许访问本地或内网地址');
+      throw new RemoteUrlError('不允许访问本地或内网地址');
     }
 
     return url;
@@ -84,8 +114,62 @@ export async function assertSafeRemoteUrl(rawUrl: string): Promise<URL> {
   const addresses = await lookup(hostname, { all: true, verbatim: true });
 
   if (addresses.length === 0 || addresses.some((item) => isPrivateAddress(item.address))) {
-    throw new Error('不允许访问本地或内网地址');
+    throw new RemoteUrlError('不允许访问本地或内网地址');
   }
 
   return url;
+}
+
+export async function resolveSafeAddress(rawUrl: string): Promise<{ url: URL; address: string; family: 4 | 6 }> {
+  const url = await assertSafeRemoteUrl(rawUrl);
+  const hostname = url.hostname.toLowerCase();
+
+  if (isIP(hostname)) {
+    return { url, address: hostname, family: isIP(hostname) as 4 | 6 };
+  }
+
+  const addresses = await lookup(hostname, { all: true, verbatim: true });
+  const safe = addresses.find((item) => !isPrivateAddress(item.address));
+
+  if (!safe) {
+    throw new RemoteUrlError('不允许访问本地或内网地址');
+  }
+
+  return { url, address: safe.address, family: safe.family as 4 | 6 };
+}
+
+export function createSafeLookup() {
+  const lookupFn: any = (hostname: string, options: any, callback: any) => {
+    const opts = typeof options === 'function' ? {} : options || {};
+    const cb = typeof options === 'function' ? options : callback;
+
+    if (isBlockedHostname(hostname.toLowerCase())) {
+      cb(new Error('不允许访问本地或内网地址'));
+      return;
+    }
+
+    const numericOpts = typeof opts === 'number' ? { family: opts } : opts;
+    dnsLookup(hostname, { ...numericOpts, all: true, verbatim: true }, (err, addresses) => {
+      if (err) {
+        cb(err);
+        return;
+      }
+
+      const list = (Array.isArray(addresses) ? addresses : [{ address: addresses as unknown as string, family: 4 }]) as LookupAddress[];
+
+      if (list.length === 0 || list.some((item) => isPrivateAddress(item.address))) {
+        cb(new Error('不允许访问本地或内网地址'));
+        return;
+      }
+
+      if (numericOpts.all) {
+        cb(null, list);
+        return;
+      }
+
+      const first = list[0];
+      cb(null, first.address, first.family);
+    });
+  };
+  return lookupFn;
 }
